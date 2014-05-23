@@ -9,7 +9,7 @@ import com.limelight.nvstream.av.DecodeUnit;
 import com.limelight.nvstream.av.RtpPacket;
 import com.limelight.nvstream.av.ConnectionStatusListener;
 
-public class VideoDepacketizer {
+public class VideoDepacketizerFec {
 	
 	// Current frame state
 	private LinkedList<ByteBufferDescriptor> avcFrameDataChain = null;
@@ -18,7 +18,11 @@ public class VideoDepacketizer {
 	
 	// Sequencing state
 	private int lastPacketInStream = 0;
+	private int nextFrameNumber = 1;
+	private int nextPacketNumber;
+	private int startFrameNumber = 1;
 	private boolean waitingForNextSuccessfulFrame;
+	private boolean gotNextFrameStart;
 	
 	// Cached objects
 	private ByteBufferDescriptor cachedDesc = new ByteBufferDescriptor(null, 0, 0);
@@ -29,7 +33,7 @@ public class VideoDepacketizer {
 	private static final int DU_LIMIT = 15;
 	private LinkedBlockingQueue<DecodeUnit> decodedUnits = new LinkedBlockingQueue<DecodeUnit>(DU_LIMIT);
 	
-	public VideoDepacketizer(VideoDecoderRenderer directSubmitDr, ConnectionStatusListener controlListener)
+	public VideoDepacketizerFec(VideoDecoderRenderer directSubmitDr, ConnectionStatusListener controlListener)
 	{
 		this.directSubmitDr = directSubmitDr;
 		this.controlListener = controlListener;
@@ -88,7 +92,7 @@ public class VideoDepacketizer {
 		}
 	}
 	
-	public void addInputDataSlow(VideoPacket packet, ByteBufferDescriptor location)
+	public void addInputDataSlow(VideoPacketFec packet, ByteBufferDescriptor location)
 	{
 		while (location.length != 0)
 		{
@@ -171,7 +175,7 @@ public class VideoDepacketizer {
 		}
 	}
 	
-	public void addInputDataFast(VideoPacket packet, ByteBufferDescriptor location, boolean firstPacket)
+	public void addInputDataFast(VideoPacketFec packet, ByteBufferDescriptor location, boolean firstPacket)
 	{
 		if (firstPacket) {
 			// Setup state for the new frame
@@ -179,36 +183,119 @@ public class VideoDepacketizer {
 			avcFrameDataLength = 0;
 		}
 		
-		if (avcFrameDataChain != null) {
-			// Add the payload data to the chain
-			avcFrameDataChain.add(location);
-			avcFrameDataLength += location.length;
-		}
+		// Add the payload data to the chain
+		avcFrameDataChain.add(location);
+		avcFrameDataLength += location.length;
 	}
 	
-	public void addInputData(VideoPacket packet)
+	public void addInputData(VideoPacketFec packet)
 	{	
 		ByteBufferDescriptor location = packet.getNewPayloadDescriptor();
 		
-		int streamPacketIndex = packet.getPacketIndex();
+		// Runt packets get decoded using the slow path
+		// These packets stand alone so there's no need to verify
+		// sequencing before submitting
+		if (location.length < 968) {
+			addInputDataSlow(packet, location);
+            return;
+		}
 		
-		// Check that this is the next frame
-		boolean firstPacket = (packet.getFlags() & VideoPacket.FLAG_SOF) != 0;
-		if (streamPacketIndex != (int)(lastPacketInStream + 1)) {
-			LimeLog.warning("Packet loss from "+(lastPacketInStream + 1)+" to "+streamPacketIndex);
-			
-			// Packets were lost so report this to the server
-			controlListener.connectionLostPackets(lastPacketInStream, streamPacketIndex);
-			
-			// Start waiting for the next frame
-			waitingForNextSuccessfulFrame = true;
-			clearAvcFrameState();
-			lastPacketInStream = streamPacketIndex;
+		int frameIndex = packet.getFrameIndex();
+		int packetIndex = packet.getPacketIndex();
+		int packetsInFrame = packet.getTotalPackets();
+		
+		// We can use FEC to correct single packet errors
+		// on single packet frames because we just get a
+		// duplicate of the original packet
+		if (packetsInFrame == 1 && packetIndex == 1 &&
+			nextPacketNumber == 0 && frameIndex == nextFrameNumber) {
+			LimeLog.info("Using FEC for error correction");
+			nextPacketNumber = 1;
+		}
+		// Discard the rest of the FEC data until we know how to use it
+		else if (packetIndex >= packetsInFrame) {
 			return;
 		}
-		else {
-			lastPacketInStream = streamPacketIndex;
+		
+		// Check that this is the next frame
+		boolean firstPacket = (packet.getFlags() & VideoPacketFec.FLAG_SOF) != 0;
+		if (frameIndex > nextFrameNumber) {
+			// Nope, but we can still work with it if it's
+			// the start of the next frame
+			if (firstPacket) {
+				LimeLog.warning("Got start of frame "+frameIndex+
+						" when expecting packet "+nextPacketNumber+
+						" of frame "+nextFrameNumber);
+				nextFrameNumber = frameIndex;
+				nextPacketNumber = 0;
+				clearAvcFrameState();
+				
+				// Tell the encoder when we're done decoding this frame
+				// that we lost some previous frames
+				waitingForNextSuccessfulFrame = true;
+				gotNextFrameStart = false;
+			}
+			else {
+				LimeLog.warning("Got packet "+packetIndex+" of frame "+frameIndex+
+						" when expecting packet "+nextPacketNumber+
+						" of frame "+nextFrameNumber);
+				// We dropped the start of this frame too
+				waitingForNextSuccessfulFrame = true;
+				gotNextFrameStart = false;
+				
+				// Try to pickup on the next frame
+				nextFrameNumber = frameIndex + 1;
+				nextPacketNumber = 0;
+				clearAvcFrameState();
+				return;
+			}
 		}
+		else if (frameIndex < nextFrameNumber) {
+			LimeLog.info("Frame "+frameIndex+" is behind our current frame number "+nextFrameNumber);
+			// Discard the frame silently if it's behind our current sequence number
+			return;
+		}
+		
+		// We know it's the right frame, now check the packet number
+		if (packetIndex != nextPacketNumber) {
+			LimeLog.warning("Frame "+frameIndex+": expected packet "+nextPacketNumber+" but got "+packetIndex);
+			// At this point, we're guaranteed that it's not FEC data that we lost
+			waitingForNextSuccessfulFrame = true;
+			gotNextFrameStart = false;
+			
+			// Skip this frame
+			nextFrameNumber++;
+			nextPacketNumber = 0;
+			clearAvcFrameState();
+			return;
+		}
+		
+		if (waitingForNextSuccessfulFrame) {
+			if (!gotNextFrameStart) {
+				if (!firstPacket) {
+					// We're waiting for the next frame, but this one is a fragment of a frame
+					// so we must discard it and wait for the next one
+					LimeLog.warning("Expected start of frame "+frameIndex);
+					
+					nextFrameNumber = frameIndex + 1;
+					nextPacketNumber = 0;
+					clearAvcFrameState();
+					return;
+				}
+				else {
+					gotNextFrameStart = true;
+				}
+			}
+		}
+		
+		int streamPacketIndex = packet.getStreamPacketIndex();
+		if (streamPacketIndex != (int)(lastPacketInStream + 1)) {
+			// Packets were lost so report this to the server
+			controlListener.connectionLostPackets(lastPacketInStream, streamPacketIndex);
+		}
+		lastPacketInStream = streamPacketIndex;
+		
+		nextPacketNumber++;
 		
 		// Remove extra padding
 		location.length = packet.getPayloadLength();
@@ -227,21 +314,30 @@ public class VideoDepacketizer {
 
 		addInputDataFast(packet, location, firstPacket);
 		
-		if ((packet.getFlags() & VideoPacket.FLAG_EOF) != 0) {
+		// We can't use the EOF flag here because real frames can be split across
+		// multiple "frames" when packetized to fit under the bandwidth ceiling
+		if (packetIndex + 1 >= packetsInFrame) {
+	        nextFrameNumber++;
+	        nextPacketNumber = 0;
+		}
+		
+		if ((packet.getFlags() & VideoPacketFec.FLAG_EOF) != 0) {
 	        reassembleAvcFrame(packet.getFrameIndex());
 			
 			if (waitingForNextSuccessfulFrame) {
-				// Arguments are unused currently
-				controlListener.connectionDetectedFrameLoss(-1, -1);
+				// This is the next successful frame after a loss event
+				controlListener.connectionDetectedFrameLoss(startFrameNumber, nextFrameNumber - 1);
 				waitingForNextSuccessfulFrame = false;
 			}
+			
+	        startFrameNumber = nextFrameNumber;
 		}
 	}
 	
 	public void addInputData(RtpPacket packet)
 	{
 		ByteBufferDescriptor rtpPayload = packet.getNewPayloadDescriptor();
-		addInputData(new VideoPacket(rtpPayload));
+		addInputData(new VideoPacketFec(rtpPayload));
 	}
 	
 	public DecodeUnit getNextDecodeUnit() throws InterruptedException

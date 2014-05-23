@@ -5,28 +5,32 @@ import java.nio.ByteOrder;
 
 import com.limelight.nvstream.av.ByteBufferDescriptor;
 
-public class VideoPacket {
+public class VideoPacketFec {
 	private ByteBufferDescriptor buffer;
 	
 	private int frameIndex;
 	private int packetIndex;
+	private int totalPackets;
 	private int payloadLength;
 	private int flags;
+	private int streamPacketIndex;
 	
 	public static final int FLAG_EOF = 0x2;
 	public static final int FLAG_SOF = 0x4;
 	
-	public VideoPacket(ByteBufferDescriptor rtpPayload)
+	public VideoPacketFec(ByteBufferDescriptor rtpPayload)
 	{
 		buffer = new ByteBufferDescriptor(rtpPayload);
 		
 		ByteBuffer bb = ByteBuffer.wrap(buffer.data).order(ByteOrder.LITTLE_ENDIAN);
 		bb.position(buffer.offset);
 		
+		frameIndex = bb.getInt();
+		packetIndex = bb.getInt();
+		totalPackets = bb.getInt();
 		flags = bb.getInt();
 		payloadLength = bb.getInt();
-		packetIndex = bb.getInt();
-		frameIndex = bb.getInt();
+		streamPacketIndex = bb.getInt();
 	}
 	
 	public int getFlags()
@@ -49,8 +53,18 @@ public class VideoPacket {
 		return payloadLength;
 	}
 	
+	public int getTotalPackets()
+	{
+		return totalPackets;
+	}
+	
+	public int getStreamPacketIndex()
+	{
+		return streamPacketIndex;
+	}
+	
 	public ByteBufferDescriptor getNewPayloadDescriptor()
 	{
-		return new ByteBufferDescriptor(buffer.data, buffer.offset+44, buffer.length-44);
+		return new ByteBufferDescriptor(buffer.data, buffer.offset+56, buffer.length-56);
 	}
 }

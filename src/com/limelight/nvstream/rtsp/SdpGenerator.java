@@ -210,10 +210,13 @@ public class SdpGenerator {
 		addSessionAttribute(config, "x-nv-vqos[0].bn.notifyUpBoundThreshold", "40");
 		addSessionAttribute(config, "x-nv-vqos[0].bn.notifyLowBoundThreshold", "25");
 		addSessionAttribute(config, "x-nv-vqos[0].bn.notifyWaitTime", "3000");
-		addSessionAttribute(config, "x-nv-vqos[0].fec.enable", "1");
+		
+		// Disable FEC while we can't use it
+		addSessionAttribute(config, "x-nv-vqos[0].fec.enable", "0");
 		addSessionAttribute(config, "x-nv-vqos[0].fec.numSrcPackets", "50");
 		addSessionAttribute(config, "x-nv-vqos[0].fec.numOutPackets", "60");
 		addSessionAttribute(config, "x-nv-vqos[0].fec.repairPercent", "20");
+		
 		addSessionAttribute(config, "x-nv-vqos[0].pictureRefreshIntervalMs", "0");
 		addSessionAttribute(config, "x-nv-vqos[0].videoQualityScoreUpdateTime", "5000");
 		addSessionAttribute(config, "x-nv-vqos[0].invalidateThreshold", "3");
